@@ -626,7 +626,7 @@ fn resolve_create_path(target: &Path, raw: &str, root: &Path) -> Option<PathBuf>
     target.parent().unwrap_or(Path::new(".")).join(raw)
   };
   let normalized = normalize_lexical(&joined)?;
-  let mut ancestor = normalized.as_path();
+  let mut ancestor = normalized.parent()?;
   while !ancestor.exists() {
     ancestor = ancestor.parent()?;
   }

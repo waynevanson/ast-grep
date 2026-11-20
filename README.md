@@ -14,9 +14,11 @@
 </p>
 
 
-## ast-grep(sg)
+## multi-ast-grep(sg)
 
 ast-grep(sg) is a CLI tool for code structural search, lint, and rewriting.
+
+The multi is the feature of Multi File Rewriters, which allows a change to a file to reference multiple files.
 
 ## Introduction
 ast-grep is an [abstract syntax tree](https://dev.to/balapriya/abstract-syntax-tree-ast-explained-in-plain-english-1h38) based tool to search code by pattern code. Think of it as your old-friend [`grep`](https://en.wikipedia.org/wiki/Grep#:~:text=grep%20is%20a%20command%2Dline,which%20has%20the%20same%20effect.), but matching AST nodes instead of text.

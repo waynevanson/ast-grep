@@ -452,6 +452,9 @@ multiWriters:
     search:
       - files: ['**/*.ts']
         rule: { pattern: 'import { $OLD } from $SPEC' }
+    create:
+      - path: 'generated-$NEW.ts'
+        template: 'export const $NEW = $INIT;'
     rewrite:
       - id: rename-ref
         rule: { pattern: $OLD }
@@ -472,6 +475,7 @@ multiWriters:
     assert_eq!(writer.max_files, 10);
     assert_eq!(writer.follow.len(), 1);
     assert_eq!(writer.search.len(), 1);
+    assert_eq!(writer.create.len(), 1);
     assert_eq!(writer.rewrite.len(), 1);
   }
 

@@ -1,4 +1,4 @@
-use crate::check_var::check_rewriter_fix;
+use crate::check_var::{check_fixer_vars, check_rewriter_fix};
 use crate::fixer::{Fixer, FixerError, SerializableFixer};
 use crate::rewriter::{Rewriter, RewriterError, SerializableRewriter};
 use crate::rule::DeserializeEnv;
@@ -22,6 +22,7 @@ pub struct MultiWriter {
   pub id: String,
   pub follow: Vec<FollowRule>,
   pub search: Vec<SearchRule>,
+  pub create: Vec<CreateRule>,
   pub rewrite: Vec<Rewriter>,
   pub recursive: bool,
   pub max_depth: usize,
@@ -37,6 +38,16 @@ pub struct FollowRule {
 pub struct SearchRule {
   pub matcher: RuleCore,
   pub files: GlobSet,
+}
+
+/// Creates a new file from a template after discovery completes.
+///
+/// The path is relative to the matched seed file. The template can use
+/// variables gathered from the seed and every discovered file.
+pub struct CreateRule {
+  pub path: Fixer,
+  pub template: Fixer,
+  pub overwrite: bool,
 }
 
 const DEFAULT_MAX_DEPTH: usize = 8;
@@ -73,6 +84,9 @@ pub struct SerializableMultiWriter {
   /// Rules that search a candidate file set for references.
   #[serde(default)]
   pub search: Vec<SerializableSearch>,
+  /// New files to create from templates after discovery.
+  #[serde(default)]
+  pub create: Vec<SerializableCreate>,
   /// Rewriters applied to every visited file, including the seed file.
   pub rewrite: Vec<SerializableRewriter>,
   /// Whether to continue discovering related files from visited files.
@@ -104,6 +118,18 @@ pub struct SerializableSearch {
   /// Globs for candidate files, relative to the project root.
   #[serde(default)]
   pub files: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializableCreate {
+  /// Path template, relative to the matched seed file.
+  pub path: String,
+  /// Initial file content template.
+  pub template: String,
+  /// Replace an existing file. Defaults to false.
+  #[serde(default)]
+  pub overwrite: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, JsonSchema, PartialEq, Eq)]
@@ -169,6 +195,19 @@ impl SerializableMultiWriter {
     for rule in &search {
       allowed_vars.extend(rule.matcher.defined_vars());
     }
+    let mut create = Vec::with_capacity(self.create.len());
+    for rule in &self.create {
+      let path = Fixer::from_str(&rule.path, &env.lang).map_err(|e| attach_id(e.into()))?;
+      let template = Fixer::from_str(&rule.template, &env.lang).map_err(|e| attach_id(e.into()))?;
+      check_fixer_vars(&allowed_vars, &path).map_err(|e| attach_id(e.into()))?;
+      check_fixer_vars(&allowed_vars, &template).map_err(|e| attach_id(e.into()))?;
+      create.push(CreateRule {
+        path,
+        template,
+        overwrite: rule.overwrite,
+      });
+    }
+
     let mut rewrite = Vec::with_capacity(self.rewrite.len());
     for rewriter in &self.rewrite {
       let parsed = rewriter
@@ -181,6 +220,7 @@ impl SerializableMultiWriter {
       id: self.id.clone(),
       follow,
       search,
+      create,
       rewrite,
       recursive: self.recursive,
       max_depth: self.max_depth.unwrap_or(DEFAULT_MAX_DEPTH).max(1),

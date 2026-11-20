@@ -20,8 +20,8 @@ pub use combined::{CombinedScan, NO_SUPPRESS_ALL_ID, UNUSED_SUPPRESSION_ID};
 pub use fixer::Fixer;
 pub use label::{Label, LabelStyle};
 pub use multi_writer::{
-  FollowResolve, FollowRule, MultiWriter, MultiWriterError, MultiWriterErrorReason, SearchRule,
-  SerializableFollow, SerializableMultiWriter, SerializableSearch,
+  CreateRule, FollowResolve, FollowRule, MultiWriter, MultiWriterError, MultiWriterErrorReason,
+  SearchRule, SerializableCreate, SerializableFollow, SerializableMultiWriter, SerializableSearch,
 };
 pub use rule::DeserializeEnv;
 pub use rule::referent_rule::GlobalRules;

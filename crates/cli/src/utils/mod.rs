@@ -114,6 +114,16 @@ pub fn write_atomically(path: &Path, content: &str) -> Result<()> {
   Ok(())
 }
 
+/// Create a new file, including its parent directories, atomically.
+pub fn write_new_file(path: &Path, content: &str) -> Result<()> {
+  let parent = path.parent().unwrap_or_else(|| Path::new("."));
+  std::fs::create_dir_all(parent)?;
+  let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+  temp.write_all(content.as_bytes())?;
+  temp.persist(path).map_err(|error| error.error)?;
+  Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) struct EmptyFile;
 

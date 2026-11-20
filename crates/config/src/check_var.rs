@@ -122,6 +122,10 @@ fn check_var_in_transform<'r>(
   Ok(vars)
 }
 
+pub(crate) fn check_fixer_vars(vars: &HashSet<&str>, fixer: &Fixer) -> RResult<()> {
+  check_var_in_fix(vars.clone(), std::slice::from_ref(fixer))
+}
+
 fn check_var_in_fix(vars: HashSet<&str>, fixers: &[Fixer]) -> RResult<()> {
   for fixer in fixers {
     for var in fixer.used_vars() {

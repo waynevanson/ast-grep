@@ -805,6 +805,14 @@
           },
           "default": []
         },
+        "create": {
+          "description": "New files to create from templates after discovery.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SerializableCreate"
+          },
+          "default": []
+        },
         "rewrite": {
           "description": "Rewriters applied to every visited file, including the seed file.",
           "type": "array",
@@ -957,6 +965,28 @@
       },
       "required": [
         "rule"
+      ]
+    },
+    "SerializableCreate": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Path template, relative to the matched seed file.",
+          "type": "string"
+        },
+        "template": {
+          "description": "Initial file content template.",
+          "type": "string"
+        },
+        "overwrite": {
+          "description": "Replace an existing file. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "path",
+        "template"
       ]
     },
     "Language": {

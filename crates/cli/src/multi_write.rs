@@ -7,11 +7,12 @@
 use crate::config::{ProjectConfig, read_rule_file};
 use crate::lang::SgLang;
 use crate::print::ColorArg;
-use crate::utils::{DiffStyles, InputArgs, RuleOverwrite, write_atomically};
+use crate::utils::{DiffStyles, InputArgs, RuleOverwrite, write_atomically, write_new_file};
 
 use anyhow::{Result, anyhow};
 use ast_grep_config::{
-  FollowResolve, FollowRule, GlobalRules, MultiWriter, RuleCollection, RuleConfig, from_yaml_string,
+  CreateRule, Fixer, FollowResolve, FollowRule, GlobalRules, MultiWriter, RuleCollection,
+  RuleConfig, from_yaml_string,
 };
 use ast_grep_core::meta_var::MetaVarEnv;
 use ast_grep_core::replacer::Replacer;
@@ -23,7 +24,7 @@ use ignore::WalkState;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -199,6 +200,8 @@ struct MultiWriteSession {
   files: HashMap<PathBuf, String>,
   /// Content as it was on disk when the file was first visited.
   originals: HashMap<PathBuf, String>,
+  /// Files that do not exist on disk and must be created on commit.
+  created: HashSet<PathBuf>,
 }
 
 impl MultiWriteSession {
@@ -208,6 +211,7 @@ impl MultiWriteSession {
       candidates,
       files: HashMap::new(),
       originals: HashMap::new(),
+      created: HashSet::new(),
     }
   }
 
@@ -240,12 +244,17 @@ impl MultiWriteSession {
     for path in paths {
       let old = self.originals.get(&path).cloned().unwrap_or_default();
       let new = self.files.get(&path).cloned().unwrap_or_default();
-      if old == new {
+      let is_new = !self.originals.contains_key(&path);
+      if old == new && !is_new {
         continue;
       }
       changed += 1;
       if update_all {
-        write_atomically(&path, &new)?;
+        if !is_new {
+          write_atomically(&path, &new)?;
+        } else {
+          write_new_file(&path, &new)?;
+        }
       } else {
         let display = path.strip_prefix(&self.root).unwrap_or(&path);
         println!("{}", display.display());
@@ -273,9 +282,44 @@ fn run_seed(
     ));
   };
 
+  let discovery = discover(writer, rule, seed, session);
+  write_discovered(writer, rule, seed, &discovery, session);
+  Ok(())
+}
+
+struct VisitedFile {
+  path: PathBuf,
+  bindings: HashMap<String, String>,
+}
+
+struct Discovery {
+  files: Vec<VisitedFile>,
+  /// Variables merged from the seed and every discovered match.
+  /// The first binding of a name wins, mirroring rewriter env pinning.
+  vars: HashMap<String, String>,
+}
+
+fn discover(
+  writer: &MultiWriter,
+  rule: &RuleConfig<SgLang>,
+  seed: &Seed,
+  session: &MultiWriteSession,
+) -> Discovery {
   let mut queue = VecDeque::from([(seed.path.clone(), 0usize, seed.vars.clone())]);
   let mut seen = HashSet::new();
+  let mut warned = HashSet::new();
+  let mut files = vec![];
+  let mut vars = seed.vars.clone();
   while let Some((path, depth, bindings)) = queue.pop_front() {
+    // Rewriters inherit the enclosing rule environment, but do not inherit
+    // match variables recursively. The same rule applies here: seed variables
+    // are inherited by every file, while local discovery variables belong to
+    // the file that produced them.
+    for conflict in merge_keep_first(&mut vars, &bindings) {
+      if warned.insert(conflict.clone()) {
+        eprintln!("warning: multi-writer variable conflict: {conflict}");
+      }
+    }
     if seen.len() >= writer.max_files || !seen.insert(path.clone()) {
       continue;
     }
@@ -285,37 +329,131 @@ fn run_seed(
     if lang != rule.language {
       continue;
     }
-    let Ok(content) = session.load(&path) else {
+    let Some(content) = session.peek(&path) else {
       continue;
     };
-    let grep = lang.ast_grep(content.clone());
+    let grep = lang.ast_grep(content);
+    files.push(VisitedFile {
+      path: path.clone(),
+      bindings: bindings.clone(),
+    });
 
-    let mut edits = if depth == 0 && path == seed.path {
+    // Seed matching always starts from the enclosing rule env. Match variables
+    // from this file are not passed further down the traversal.
+    if depth == 0 {
+      for (target, target_vars) in
+        collect_search_targets(writer, session, &seed.vars, rule.language)
+      {
+        for conflict in merge_keep_first(&mut vars, &target_vars) {
+          if warned.insert(conflict.clone()) {
+            eprintln!("warning: multi-writer variable conflict: {conflict}");
+          }
+        }
+        queue.push_back((target, depth + 1, target_vars));
+      }
+    }
+    if (depth == 0 || writer.recursive) && depth < writer.max_depth {
+      let targets = collect_follow_targets(writer, &grep, &seed.vars, &path, &session.root);
+      for (target, target_vars) in targets {
+        for conflict in merge_keep_first(&mut vars, &target_vars) {
+          if warned.insert(conflict.clone()) {
+            eprintln!("warning: multi-writer variable conflict: {conflict}");
+          }
+        }
+        queue.push_back((target, depth + 1, target_vars));
+      }
+    }
+  }
+  Discovery { files, vars }
+}
+
+fn merge_keep_first(
+  target: &mut HashMap<String, String>,
+  incoming: &HashMap<String, String>,
+) -> Vec<String> {
+  let mut conflicts = vec![];
+  for (name, value) in incoming {
+    match target.get(name) {
+      Some(existing) if existing != value => {
+        conflicts.push(format!("`{name}` kept as {existing:?}; ignored {value:?}"))
+      }
+      Some(_) => {}
+      None => {
+        target.insert(name.clone(), value.clone());
+      }
+    }
+  }
+  conflicts
+}
+
+fn write_discovered(
+  writer: &MultiWriter,
+  rule: &RuleConfig<SgLang>,
+  seed: &Seed,
+  discovery: &Discovery,
+  session: &mut MultiWriteSession,
+) {
+  for file in &discovery.files {
+    // Mirror a rewriter match: inherit the seed environment plus the
+    // variables captured by the match that discovered this file.
+    let vars = &file.bindings;
+    let Ok(content) = session.load(&file.path) else {
+      continue;
+    };
+    let Some(lang) = SgLang::from_path(&file.path) else {
+      continue;
+    };
+    if lang != rule.language {
+      continue;
+    }
+    let grep = lang.ast_grep(content.clone());
+    let mut edits = if file.path == seed.path {
       collect_seed_fix_edits(rule, &content, seed, lang)
     } else {
       vec![]
     };
-    edits.extend(collect_rewrite_edits(writer, &grep, &bindings));
+    edits.extend(collect_rewrite_edits(writer, &grep, vars));
     if !edits.is_empty() {
       let new_content = apply_edits(&content, edits);
       if new_content != content {
-        session.files.insert(path.clone(), new_content);
-      }
-    }
-
-    if depth == 0 {
-      for target in collect_search_targets(writer, session, &bindings, rule.language) {
-        queue.push_back((target, depth + 1, bindings.clone()));
-      }
-    }
-    if (depth == 0 || writer.recursive) && depth < writer.max_depth {
-      let targets = collect_follow_targets(writer, &grep, &bindings, &path, &session.root);
-      for (target, vars) in targets {
-        queue.push_back((target, depth + 1, vars));
+        session.files.insert(file.path.clone(), new_content);
       }
     }
   }
-  Ok(())
+
+  for create in &writer.create {
+    create_file(create, seed, rule.language, discovery, session);
+  }
+}
+
+fn create_file(
+  create: &CreateRule,
+  seed: &Seed,
+  lang: SgLang,
+  discovery: &Discovery,
+  session: &mut MultiWriteSession,
+) {
+  let rendered_path = render_template(&create.path, &discovery.vars, lang);
+  let Some(path) = resolve_create_path(&seed.path, &rendered_path, &session.root) else {
+    eprintln!(
+      "warning: cannot resolve created file path `{}`",
+      rendered_path.trim()
+    );
+    return;
+  };
+  let exists = session.files.contains_key(&path) || path.exists();
+  if exists && !create.overwrite {
+    return;
+  }
+  if path.exists() && !session.created.contains(&path) {
+    if let Ok(original) = std::fs::read_to_string(&path) {
+      session.originals.entry(path.clone()).or_insert(original);
+    }
+  } else if !path.exists() {
+    session.created.insert(path.clone());
+  }
+  let content = render_template(&create.template, &discovery.vars, lang);
+  session.files.insert(path, content);
 }
 
 fn collect_seed_fix_edits(
@@ -377,7 +515,7 @@ fn collect_search_targets(
   session: &MultiWriteSession,
   bindings: &HashMap<String, String>,
   lang: SgLang,
-) -> Vec<PathBuf> {
+) -> Vec<(PathBuf, HashMap<String, String>)> {
   if writer.search.is_empty() {
     return vec![];
   }
@@ -404,18 +542,26 @@ fn collect_search_targets(
       continue;
     };
     let grep = lang.ast_grep(content);
+    let mut matched_vars = None;
     'rules: for search in matching {
       for node in grep.root().dfs() {
         let mut env = Cow::Owned(seed_env(bindings));
-        if search.matcher.match_node_with_env(node, &mut env).is_some() {
-          targets.push(path.clone());
+        if let Some(matched) = search.matcher.match_node_with_env(node, &mut env) {
+          let matched = NodeMatch::new(matched, env.into_owned());
+          let mut vars = bindings.clone();
+          let local: HashMap<String, String> = matched.get_env().clone().into();
+          vars.extend(local);
+          matched_vars = Some(vars);
           break 'rules;
         }
       }
     }
+    if let Some(vars) = matched_vars {
+      targets.push((path.clone(), vars));
+    }
   }
-  targets.sort();
-  targets.dedup();
+  targets.sort_by(|a, b| a.0.cmp(&b.0));
+  targets.dedup_by(|a, b| a.0 == b.0);
   targets
 }
 
@@ -460,6 +606,54 @@ fn match_follow(
   vars.extend(matched_vars);
   let paths = resolve_target(from, &rendered, follow.resolve, root);
   Some((paths, vars))
+}
+
+fn render_template(template: &Fixer, vars: &HashMap<String, String>, lang: SgLang) -> String {
+  let dummy = lang.ast_grep("");
+  let matched = NodeMatch::new(dummy.root(), seed_env(vars));
+  let bytes = template.generate_replacement(&matched);
+  String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn resolve_create_path(target: &Path, raw: &str, root: &Path) -> Option<PathBuf> {
+  let raw = unquote(raw.trim());
+  if raw.is_empty() {
+    return None;
+  }
+  let joined = if Path::new(raw).is_absolute() {
+    PathBuf::from(raw)
+  } else {
+    target.parent().unwrap_or(Path::new(".")).join(raw)
+  };
+  let normalized = normalize_lexical(&joined)?;
+  let mut ancestor = normalized.as_path();
+  while !ancestor.exists() {
+    ancestor = ancestor.parent()?;
+  }
+  let canonical = ancestor.canonicalize().ok()?;
+  if !canonical.starts_with(root) {
+    return None;
+  }
+  let suffix = normalized.strip_prefix(ancestor).ok()?;
+  Some(canonical.join(suffix))
+}
+
+fn normalize_lexical(path: &Path) -> Option<PathBuf> {
+  let mut normalized = PathBuf::new();
+  for component in path.components() {
+    match component {
+      Component::CurDir => {}
+      Component::ParentDir => {
+        if !normalized.pop() {
+          return None;
+        }
+      }
+      Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+        normalized.push(component.as_os_str());
+      }
+    }
+  }
+  Some(normalized)
 }
 
 fn resolve_target(from: &Path, raw: &str, resolve: FollowResolve, root: &Path) -> Vec<PathBuf> {

@@ -59,6 +59,26 @@
         "$ref": "#/$defs/SerializableRewriter"
       }
     },
+    "multiWriters": {
+      "description": "Named cross-file rewrite definitions.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/SerializableMultiWriter"
+      }
+    },
+    "multiFix": {
+      "description": "Multi-writer ids applied when this rule matches.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
     "id": {
       "description": "Unique, descriptive identifier, e.g., no-unused-variable",
       "type": "string",
@@ -206,6 +226,10 @@
             "default_expression",
             "delegate_declaration",
             "destructor_declaration",
+            "directive_kind",
+            "directive_name",
+            "directive_separator",
+            "directive_value",
             "discard",
             "do_statement",
             "element_access_expression",
@@ -220,6 +244,8 @@
             "explicit_interface_specifier",
             "expression_element",
             "expression_statement",
+            "extension_body",
+            "extension_declaration",
             "extern_alias_directive",
             "field_declaration",
             "file_scoped_namespace_declaration",
@@ -237,6 +263,7 @@
             "group_clause",
             "identifier",
             "if_statement",
+            "ignored_directive",
             "implicit_array_creation_expression",
             "implicit_object_creation_expression",
             "implicit_parameter",
@@ -313,6 +340,7 @@
             "raw_string_literal",
             "raw_string_start",
             "real_literal",
+            "receiver_parameter",
             "record_declaration",
             "recursive_pattern",
             "ref_expression",
@@ -325,6 +353,7 @@
             "select_clause",
             "shebang_directive",
             "sizeof_expression",
+            "slice_pattern",
             "spread_element",
             "stackalloc_expression",
             "string_content",
@@ -656,6 +685,10 @@
             "default_expression",
             "delegate_declaration",
             "destructor_declaration",
+            "directive_kind",
+            "directive_name",
+            "directive_separator",
+            "directive_value",
             "discard",
             "do_statement",
             "element_access_expression",
@@ -670,6 +703,8 @@
             "explicit_interface_specifier",
             "expression_element",
             "expression_statement",
+            "extension_body",
+            "extension_declaration",
             "extern_alias_directive",
             "field_declaration",
             "file_scoped_namespace_declaration",
@@ -687,6 +722,7 @@
             "group_clause",
             "identifier",
             "if_statement",
+            "ignored_directive",
             "implicit_array_creation_expression",
             "implicit_object_creation_expression",
             "implicit_parameter",
@@ -763,6 +799,7 @@
             "raw_string_literal",
             "raw_string_start",
             "real_literal",
+            "receiver_parameter",
             "record_declaration",
             "recursive_pattern",
             "ref_expression",
@@ -775,6 +812,7 @@
             "select_clause",
             "shebang_directive",
             "sizeof_expression",
+            "slice_pattern",
             "spread_element",
             "stackalloc_expression",
             "string_content",
@@ -890,6 +928,7 @@
             "expression",
             "function",
             "initializer",
+            "kind",
             "left",
             "name",
             "operator",
@@ -899,6 +938,7 @@
             "rank",
             "returns",
             "right",
+            "separator",
             "subscript",
             "type",
             "type_parameters",
@@ -1220,6 +1260,183 @@
       "required": [
         "id",
         "fix",
+        "rule"
+      ]
+    },
+    "SerializableMultiWriter": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Unique, descriptive identifier, e.g. rename-references",
+          "type": "string"
+        },
+        "follow": {
+          "description": "Rules that discover files related to the current file.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SerializableFollow"
+          },
+          "default": []
+        },
+        "search": {
+          "description": "Rules that search a candidate file set for references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SerializableSearch"
+          },
+          "default": []
+        },
+        "rewrite": {
+          "description": "Rewriters applied to every visited file, including the seed file.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SerializableRewriter"
+          }
+        },
+        "recursive": {
+          "description": "Whether to continue discovering related files from visited files.",
+          "type": "boolean",
+          "default": false
+        },
+        "maxDepth": {
+          "description": "Maximum traversal depth. Defaults to 8.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "maxFiles": {
+          "description": "Maximum number of files visited for one seed. Defaults to 1000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "rewrite"
+      ]
+    },
+    "SerializableFollow": {
+      "description": "Used for global rules, rewriters, and pyo3/napi",
+      "type": "object",
+      "properties": {
+        "rule": {
+          "description": "A rule object to find matching AST nodes",
+          "$ref": "#/$defs/SerializableRule"
+        },
+        "constraints": {
+          "description": "Additional meta variables pattern to filter matching",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/SerializableRule"
+          }
+        },
+        "utils": {
+          "description": "Utility rules that can be used in `matches`",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/SerializableRule"
+          }
+        },
+        "transform": {
+          "description": "A dictionary for metavariable manipulation. Dict key is the new variable name.\nDict value is a [transformation] that specifies how meta var is processed.\nSee [transformation doc](https://ast-grep.github.io/reference/yaml/transformation.html).",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/Transformation"
+          }
+        },
+        "path": {
+          "description": "Template that resolves to the related file path, e.g. `$SPEC`.",
+          "type": "string"
+        },
+        "resolve": {
+          "description": "How to interpret the rendered path.",
+          "$ref": "#/$defs/FollowResolve",
+          "default": "relative"
+        }
+      },
+      "required": [
+        "rule",
+        "path"
+      ]
+    },
+    "FollowResolve": {
+      "oneOf": [
+        {
+          "description": "Interpret the path relative to the current file.",
+          "type": "string",
+          "const": "relative"
+        },
+        {
+          "description": "Interpret the path as a module specifier. Relative specifiers and\nextension/index probing are supported.",
+          "type": "string",
+          "const": "module"
+        }
+      ]
+    },
+    "SerializableSearch": {
+      "description": "Used for global rules, rewriters, and pyo3/napi",
+      "type": "object",
+      "properties": {
+        "rule": {
+          "description": "A rule object to find matching AST nodes",
+          "$ref": "#/$defs/SerializableRule"
+        },
+        "constraints": {
+          "description": "Additional meta variables pattern to filter matching",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/SerializableRule"
+          }
+        },
+        "utils": {
+          "description": "Utility rules that can be used in `matches`",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/SerializableRule"
+          }
+        },
+        "transform": {
+          "description": "A dictionary for metavariable manipulation. Dict key is the new variable name.\nDict value is a [transformation] that specifies how meta var is processed.\nSee [transformation doc](https://ast-grep.github.io/reference/yaml/transformation.html).",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/Transformation"
+          }
+        },
+        "files": {
+          "description": "Globs for candidate files, relative to the project root.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "required": [
         "rule"
       ]
     },

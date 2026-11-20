@@ -3,6 +3,7 @@ mod combined;
 mod fixer;
 mod label;
 mod maybe;
+mod multi_writer;
 mod rewriter;
 mod rule;
 mod rule_collection;
@@ -18,6 +19,10 @@ use ast_grep_core::language::Language;
 pub use combined::{CombinedScan, NO_SUPPRESS_ALL_ID, UNUSED_SUPPRESSION_ID};
 pub use fixer::Fixer;
 pub use label::{Label, LabelStyle};
+pub use multi_writer::{
+  FollowResolve, FollowRule, MultiWriter, MultiWriterError, MultiWriterErrorReason, SearchRule,
+  SerializableFollow, SerializableMultiWriter, SerializableSearch,
+};
 pub use rule::DeserializeEnv;
 pub use rule::referent_rule::GlobalRules;
 pub use rule::{

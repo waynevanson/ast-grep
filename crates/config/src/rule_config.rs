@@ -3,6 +3,7 @@ use crate::GlobalRules;
 use crate::check_var::{check_fix, check_rewriters_in_transform};
 use crate::fixer::{Fixer, FixerError, SerializableFixer};
 use crate::label::{Label, LabelConfig, get_default_labels, get_labels_from_config};
+use crate::multi_writer::{MultiWriter, MultiWriterError, SerializableMultiWriter};
 use crate::rewriter::RewriterError;
 pub use crate::rewriter::SerializableRewriter;
 use crate::rule::DeserializeEnv;
@@ -65,8 +66,14 @@ pub enum RuleConfigError {
   Fixer(#[from] FixerError),
   #[error(transparent)]
   Rewriter(#[from] RewriterError),
+  #[error(transparent)]
+  MultiWriter(#[from] MultiWriterError),
   #[error("Undefined rewriter `{0}` used in transform.")]
   UndefinedRewriter(String),
+  #[error("Undefined multi-writer `{0}` used in `multiFix`.")]
+  UndefinedMultiWriter(String),
+  #[error("Duplicate multi-writer id `{0}`.")]
+  DuplicateMultiWriter(String),
   #[error("Label meta-variable `{0}` must be defined in `rule` or `constraints`.")]
   LabelVariable(String),
   #[error("Rule must specify a set of AST kinds to match. Try adding `kind` rule.")]
@@ -90,6 +97,12 @@ pub struct SerializableRuleConfig<L: Language> {
   pub fix: Option<SerializableFixer>,
   /// Rewrite rules for `rewrite` transformation
   pub rewriters: Option<Vec<SerializableRewriter>>,
+  /// Named cross-file rewrite definitions.
+  #[serde(rename = "multiWriters", alias = "multi_writers")]
+  pub multi_writers: Option<Vec<SerializableMultiWriter>>,
+  /// Multi-writer ids applied when this rule matches.
+  #[serde(rename = "multiFix", alias = "multi_fix")]
+  pub multi_fix: Option<Vec<String>>,
   /// Unique, descriptive identifier, e.g., no-unused-variable
   #[serde(default)]
   pub id: String,
@@ -132,6 +145,8 @@ const RULE_CONFIG_FIELDS: &[&str] = &[
   "transform",
   "fix",
   "rewriters",
+  "multiWriters",
+  "multiFix",
   "message",
   "note",
   "severity",
@@ -269,6 +284,8 @@ pub struct RuleConfig<L: Language> {
   inner: SerializableRuleConfig<L>,
   pub matcher: RuleCore,
   pub fixer: Vec<Fixer>,
+  pub multi_writers: HashMap<String, MultiWriter>,
+  pub multi_fix: Vec<String>,
 }
 
 impl<L: Language> RuleConfig<L> {
@@ -287,11 +304,41 @@ impl<L: Language> RuleConfig<L> {
       vec![]
     };
     check_fix(&matcher, &fixer)?;
+    let env = matcher.get_env(inner.language.clone());
+    let multi_writers = Self::parse_multi_writers(&inner, &matcher, &env)?;
+    let multi_fix = inner.multi_fix.clone().unwrap_or_default();
+    for id in &multi_fix {
+      if !multi_writers.contains_key(id) {
+        return Err(RuleConfigError::UndefinedMultiWriter(id.clone()));
+      }
+    }
     Ok(Self {
       inner,
       matcher,
       fixer,
+      multi_writers,
+      multi_fix,
     })
+  }
+
+  fn parse_multi_writers(
+    inner: &SerializableRuleConfig<L>,
+    matcher: &RuleCore,
+    env: &DeserializeEnv<L>,
+  ) -> Result<HashMap<String, MultiWriter>, RuleConfigError> {
+    let Some(definitions) = &inner.multi_writers else {
+      return Ok(HashMap::new());
+    };
+    let upper_vars = matcher.defined_vars();
+    let mut writers = HashMap::with_capacity(definitions.len());
+    for definition in definitions {
+      if writers.contains_key(&definition.id) {
+        return Err(RuleConfigError::DuplicateMultiWriter(definition.id.clone()));
+      }
+      let writer = definition.try_parse(&upper_vars, env)?;
+      writers.insert(definition.id.clone(), writer);
+    }
+    Ok(writers)
   }
 
   pub fn deserialize<'de, D>(
@@ -366,6 +413,8 @@ mod test {
       id: "".into(),
       language: TypeScript::Tsx,
       rewriters: None,
+      multi_writers: None,
+      multi_fix: None,
       fix: None,
       message: "".into(),
       note: None,
@@ -383,6 +432,85 @@ mod test {
     let globals: Vec<SerializableGlobalRule<TypeScript>> =
       from_str(yaml).expect("should parse globals");
     DeserializeEnv::parse_global_utils(globals).expect("should parse global rules")
+  }
+
+  #[test]
+  fn test_multi_writer_parsing() {
+    let yaml = r"
+id: rename
+language: Tsx
+rule: { pattern: 'export const $OLD = $INIT' }
+transform:
+  NEW: { replace: { source: $OLD, replace: Old, by: New } }
+multiFix: [rename-references]
+multiWriters:
+  - id: rename-references
+    follow:
+      - rule: { pattern: 'import { $OLD } from $SPEC' }
+        path: $SPEC
+        resolve: module
+    search:
+      - files: ['**/*.ts']
+        rule: { pattern: 'import { $OLD } from $SPEC' }
+    rewrite:
+      - id: rename-ref
+        rule: { pattern: $OLD }
+        fix: $NEW
+    recursive: true
+    maxDepth: 4
+    maxFiles: 10
+";
+    let config: SerializableRuleConfig<TypeScript> = from_str(yaml).expect("should parse");
+    let config = RuleConfig::try_from(config, &Default::default()).expect("should compile");
+    assert_eq!(config.multi_fix, ["rename-references"]);
+    let writer = config
+      .multi_writers
+      .get("rename-references")
+      .expect("writer should exist");
+    assert!(writer.recursive);
+    assert_eq!(writer.max_depth, 4);
+    assert_eq!(writer.max_files, 10);
+    assert_eq!(writer.follow.len(), 1);
+    assert_eq!(writer.search.len(), 1);
+    assert_eq!(writer.rewrite.len(), 1);
+  }
+
+  #[test]
+  fn test_multi_writer_undefined_reference() {
+    let yaml = r"
+id: rename
+language: Tsx
+rule: { pattern: 'export const $OLD = $INIT' }
+multiFix: [missing]
+";
+    let config: SerializableRuleConfig<TypeScript> = from_str(yaml).expect("should parse");
+    let error = match RuleConfig::try_from(config, &Default::default()) {
+      Ok(_) => panic!("undefined multi-writer should fail"),
+      Err(error) => error,
+    };
+    assert!(matches!(error, RuleConfigError::UndefinedMultiWriter(id) if id == "missing"));
+  }
+
+  #[test]
+  fn test_multi_writer_undefined_fix_var() {
+    let yaml = r"
+id: rename
+language: Tsx
+rule: { pattern: 'export const $OLD = $INIT' }
+multiFix: [writer]
+multiWriters:
+  - id: writer
+    rewrite:
+      - id: rename-ref
+        rule: { pattern: $OLD }
+        fix: $NEW
+";
+    let config: SerializableRuleConfig<TypeScript> = from_str(yaml).expect("should parse");
+    let error = match RuleConfig::try_from(config, &Default::default()) {
+      Ok(_) => panic!("undefined fix variable should fail"),
+      Err(error) => error,
+    };
+    assert!(matches!(error, RuleConfigError::MultiWriter(_)));
   }
 
   #[test]

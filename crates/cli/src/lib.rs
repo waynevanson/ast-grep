@@ -3,6 +3,7 @@ mod config;
 mod custom_language;
 mod lang;
 mod lsp;
+mod multi_write;
 mod new;
 mod outline;
 mod print;
@@ -19,6 +20,7 @@ use completions::{CompletionsArg, run_shell_completion};
 use config::ProjectConfig;
 use custom_language::CustomLanguagePolicy;
 use lsp::{LspArg, run_language_server};
+use multi_write::{MultiWriteArg, run_multi_write};
 use new::{NewArg, run_create_new};
 use outline::{OutlineArg, run_outline};
 use run::{RunArg, run_with_pattern};
@@ -59,6 +61,8 @@ enum Commands {
   Run(RunArg),
   /// Scan and rewrite code by configuration.
   Scan(ScanArg),
+  /// Rewrite related files discovered from rule matches.
+  MultiWrite(MultiWriteArg),
   /// Test ast-grep rules.
   Test(TestArg),
   /// Create new ast-grep project or items like rules/tests.
@@ -153,6 +157,7 @@ pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
   match app.command {
     Commands::Run(arg) => run_with_pattern(arg, project),
     Commands::Scan(arg) => run_with_config(arg, project),
+    Commands::MultiWrite(arg) => run_multi_write(arg, project),
     Commands::Test(arg) => run_test_rule(arg, project),
     Commands::New(arg) => run_create_new(arg, project),
     Commands::Lsp(arg) => run_language_server(arg, project).map(|_| ExitCode::SUCCESS),

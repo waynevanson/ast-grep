@@ -18,6 +18,12 @@ pub struct MetaVarEnv<'tree, D: Doc> {
   single_matched: HashMap<MetaVariableID, Node<'tree, D>>,
   multi_matched: HashMap<MetaVariableID, Vec<Node<'tree, D>>>,
   transformed_var: HashMap<MetaVariableID, Underlying<D>>,
+  /// Variables supplied by the caller rather than captured from a node.
+  ///
+  /// Owned variables are matched by exact text and can be used in fixes.
+  /// They are useful when a definition in one document seeds a match in
+  /// another document, such as a multi-writer traversing related files.
+  owned_var: HashMap<MetaVariableID, Underlying<D>>,
 }
 
 impl<'t, D: Doc> MetaVarEnv<'t, D> {
@@ -26,7 +32,17 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
       single_matched: HashMap::new(),
       multi_matched: HashMap::new(),
       transformed_var: HashMap::new(),
+      owned_var: HashMap::new(),
     }
+  }
+
+  /// Insert a variable that is not captured from the current document.
+  ///
+  /// An owned variable pins later matches with the same name to exactly
+  /// `value`, and can be referenced by a fix template.
+  pub fn insert_owned_var(&mut self, id: &str, value: &str) {
+    let bytes = <D::Source as Content>::decode_str(value).to_vec();
+    self.owned_var.insert(id.to_string(), bytes);
   }
 
   pub fn insert(&mut self, id: &str, ret: Node<'t, D>) -> Option<&mut Self> {
@@ -78,15 +94,24 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
       .keys()
       .cloned()
       .map(|n| MetaVariable::Capture(n, false));
+    let owned = self
+      .owned_var
+      .keys()
+      .cloned()
+      .map(|n| MetaVariable::Capture(n, false));
     let multi = self
       .multi_matched
       .keys()
       .cloned()
       .map(MetaVariable::MultiCapture);
-    single.chain(multi).chain(transformed)
+    single.chain(multi).chain(transformed).chain(owned)
   }
 
   fn match_variable(&self, id: &str, candidate: &Node<'t, D>) -> bool {
+    if let Some(owned) = self.owned_var.get(id) {
+      let owned = <D::Source as Content>::encode_bytes(owned);
+      return owned.as_ref() == candidate.text().as_ref();
+    }
     if let Some(m) = self.single_matched.get(id) {
       return does_node_match_exactly(m, candidate);
     }
@@ -193,6 +218,8 @@ where
         Some(bytes)
       } else if let Some(bytes) = env.get_transformed(n) {
         Some(bytes)
+      } else if let Some(bytes) = env.owned_var.get(n) {
+        Some(bytes)
       } else {
         None
       }
@@ -289,6 +316,9 @@ impl<'tree, D: Doc> From<MetaVarEnv<'tree, D>> for HashMap<String, String> {
     for (id, bytes) in env.transformed_var {
       ret.insert(id, <D::Source as Content>::encode_bytes(&bytes).to_string());
     }
+    for (id, bytes) in env.owned_var {
+      ret.insert(id, <D::Source as Content>::encode_bytes(&bytes).to_string());
+    }
     for (id, nodes) in env.multi_matched {
       let s: Vec<_> = nodes.iter().map(|n| n.text()).collect();
       let s = s.join(", ");
@@ -304,6 +334,7 @@ mod test {
   use crate::Pattern;
   use crate::language::Tsx;
   use crate::tree_sitter::LanguageExt;
+  use crate::tree_sitter::StrDoc;
 
   fn extract_var(s: &str) -> Option<MetaVariable> {
     extract_meta_var(s, '$')
@@ -352,6 +383,24 @@ mod test {
     assert_eq!(extract("µ_"), Some(Dropped(true)));
     assert_eq!(extract("abc"), None);
     assert_eq!(extract("µabc"), None);
+  }
+
+  #[test]
+  fn test_owned_var_pins_match_and_exposes_value() {
+    let root = Tsx.ast_grep("foo + bar");
+    let foo = root.root().find("foo").unwrap().get_node().clone();
+    let bar = root.root().find("bar").unwrap().get_node().clone();
+    let mut env: MetaVarEnv<StrDoc<Tsx>> = MetaVarEnv::new();
+    env.insert_owned_var("A", "foo");
+    assert!(env.insert("A", foo).is_some());
+    assert!(env.insert("A", bar).is_none());
+
+    let mut env: MetaVarEnv<StrDoc<Tsx>> = MetaVarEnv::new();
+    env.insert_owned_var("NEW", "renamed");
+    let bytes = env
+      .get_var_bytes(&MetaVariable::Capture("NEW".into(), false))
+      .expect("owned var should be readable");
+    assert_eq!(bytes, b"renamed");
   }
 
   #[test]

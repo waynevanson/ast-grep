@@ -1,0 +1,547 @@
+//! Execute multi-writers by traversing files related to a rule match.
+//!
+//! The traversal is deliberately single-threaded per seed: a shared overlay keeps
+//! recursive edits observable and deterministic, while the initial file walk still
+//! uses the regular parallel walker.
+
+use crate::config::{ProjectConfig, read_rule_file};
+use crate::lang::SgLang;
+use crate::print::ColorArg;
+use crate::utils::{DiffStyles, InputArgs, RuleOverwrite, write_atomically};
+
+use anyhow::{Result, anyhow};
+use ast_grep_config::{
+  FollowResolve, FollowRule, GlobalRules, MultiWriter, RuleCollection, RuleConfig, from_yaml_string,
+};
+use ast_grep_core::meta_var::MetaVarEnv;
+use ast_grep_core::replacer::Replacer;
+use ast_grep_core::source::Edit;
+use ast_grep_core::tree_sitter::LanguageExt;
+use ast_grep_core::{Language, Matcher, NodeMatch};
+use clap::Args;
+use ignore::WalkState;
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+
+#[derive(Args)]
+pub struct MultiWriteArg {
+  /// Run multi-writers from the rule located at RULE_FILE.
+  #[clap(short, long, value_name = "RULE_FILE")]
+  rule: Option<PathBuf>,
+
+  /// Run multi-writers from rules defined by RULE_TEXT.
+  ///
+  /// Separate multiple rules with `---`.
+  #[clap(long, conflicts_with = "rule", value_name = "RULE_TEXT")]
+  inline_rules: Option<String>,
+
+  /// Input related options.
+  #[clap(flatten)]
+  input: InputArgs,
+
+  /// Apply all changes to disk.
+  ///
+  /// Without this flag, multi-write prints the pending diffs and leaves
+  /// the files untouched.
+  #[clap(short = 'U', long)]
+  update_all: bool,
+
+  /// Controls output color.
+  #[clap(long, default_value = "auto", value_name = "WHEN")]
+  color: ColorArg,
+}
+
+pub fn run_multi_write(mut arg: MultiWriteArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
+  if let Ok(config) = &project {
+    arg.input.apply_config(config);
+  }
+  let (rules, root) = load_rules(&arg, project)?;
+  let (seeds, candidates) = collect_seeds(&rules, &arg.input, &root)?;
+  if seeds.is_empty() {
+    eprintln!("No multi-writer seeds found.");
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  let mut session = MultiWriteSession::new(root, candidates);
+  for seed in &seeds {
+    run_seed(&mut session, &rules, seed)?;
+  }
+  let changed = session.finish(arg.update_all, arg.color)?;
+  if arg.update_all && changed > 0 {
+    eprintln!("Applied multi-writer changes to {changed} file(s).");
+  }
+  Ok(ExitCode::SUCCESS)
+}
+
+fn load_rules(
+  arg: &MultiWriteArg,
+  project: Result<ProjectConfig>,
+) -> Result<(RuleCollection<SgLang>, PathBuf)> {
+  let cwd = std::env::current_dir()?.canonicalize()?;
+  if let Some(path) = &arg.rule {
+    let globals = match &project {
+      Ok(project) => project.find_utils()?,
+      Err(_) => GlobalRules::default(),
+    };
+    let configs = read_rule_file(path, &globals)?;
+    let (collection, _) = crate::config::with_rule_stats(configs)?;
+    Ok((collection, cwd))
+  } else if let Some(text) = &arg.inline_rules {
+    let globals = match &project {
+      Ok(project) => project.find_utils()?,
+      Err(_) => GlobalRules::default(),
+    };
+    let configs = from_yaml_string(text, &globals)?;
+    let (collection, _) = crate::config::with_rule_stats(configs)?;
+    Ok((collection, cwd))
+  } else {
+    let project = project?;
+    let root = project.project_dir.canonicalize()?;
+    let (collection, _) = project.find_rules(RuleOverwrite::default())?;
+    Ok((collection, root))
+  }
+}
+
+#[derive(Clone)]
+struct Seed {
+  path: PathBuf,
+  rule_id: String,
+  writer_id: String,
+  vars: HashMap<String, String>,
+  start: usize,
+  text: String,
+}
+
+fn collect_seeds(
+  rules: &RuleCollection<SgLang>,
+  input: &InputArgs,
+  root: &Path,
+) -> Result<(Vec<Seed>, Vec<PathBuf>)> {
+  let mut langs = HashSet::new();
+  rules.for_each_rule(|rule| {
+    if !rule.multi_fix.is_empty() {
+      langs.insert(rule.language);
+    }
+  });
+  if langs.is_empty() {
+    return Ok((vec![], vec![]));
+  }
+
+  let walker = input.walk_langs(langs.into_iter())?;
+  let paths = Arc::new(Mutex::new(Vec::new()));
+  let collected = paths.clone();
+  walker.run(|| {
+    let collected = collected.clone();
+    Box::new(move |result| {
+      if let Ok(entry) = result
+        && entry
+          .file_type()
+          .is_some_and(|file_type| file_type.is_file())
+      {
+        collected.lock().unwrap().push(entry.into_path());
+      }
+      WalkState::Continue
+    })
+  });
+  let mut paths = paths.lock().unwrap().clone();
+  paths.sort();
+  let mut candidates = vec![];
+  let mut seeds = vec![];
+  for path in paths {
+    let Ok(path) = path.canonicalize() else {
+      continue;
+    };
+    let Some(lang) = SgLang::from_path(&path) else {
+      continue;
+    };
+    candidates.push(path.clone());
+    let Ok(content) = std::fs::read_to_string(&path) else {
+      continue;
+    };
+    let grep = lang.ast_grep(content);
+    let normalized = path.strip_prefix(root).unwrap_or(&path);
+    for rule in rules.for_path(normalized) {
+      if rule.multi_fix.is_empty() {
+        continue;
+      }
+      for matched in grep.root().find_all(&rule.matcher) {
+        let vars: HashMap<String, String> = matched.get_env().clone().into();
+        let start = matched.range().start;
+        let text = matched.text().to_string();
+        for writer_id in &rule.multi_fix {
+          seeds.push(Seed {
+            path: path.clone(),
+            rule_id: rule.id.clone(),
+            writer_id: writer_id.clone(),
+            vars: vars.clone(),
+            start,
+            text: text.clone(),
+          });
+        }
+      }
+    }
+  }
+  seeds.sort_by(|a, b| {
+    (&a.path, &a.rule_id, &a.writer_id, a.start).cmp(&(&b.path, &b.rule_id, &b.writer_id, b.start))
+  });
+  Ok((seeds, candidates))
+}
+
+struct MultiWriteSession {
+  root: PathBuf,
+  /// Files discovered by the initial walk, used as search candidates.
+  candidates: Vec<PathBuf>,
+  /// Final content of every visited file, including files that were not edited.
+  files: HashMap<PathBuf, String>,
+  /// Content as it was on disk when the file was first visited.
+  originals: HashMap<PathBuf, String>,
+}
+
+impl MultiWriteSession {
+  fn new(root: PathBuf, candidates: Vec<PathBuf>) -> Self {
+    Self {
+      root,
+      candidates,
+      files: HashMap::new(),
+      originals: HashMap::new(),
+    }
+  }
+
+  fn load(&mut self, path: &Path) -> Result<String> {
+    if let Some(content) = self.files.get(path) {
+      return Ok(content.clone());
+    }
+    let content = std::fs::read_to_string(path)?;
+    self
+      .originals
+      .entry(path.to_path_buf())
+      .or_insert_with(|| content.clone());
+    self.files.insert(path.to_path_buf(), content.clone());
+    Ok(content)
+  }
+
+  fn peek(&self, path: &Path) -> Option<String> {
+    self
+      .files
+      .get(path)
+      .cloned()
+      .or_else(|| std::fs::read_to_string(path).ok())
+  }
+
+  fn finish(&self, update_all: bool, color: ColorArg) -> Result<usize> {
+    let mut paths: Vec<_> = self.files.keys().cloned().collect();
+    paths.sort();
+    let styles = DiffStyles::from(color);
+    let mut changed = 0;
+    for path in paths {
+      let old = self.originals.get(&path).cloned().unwrap_or_default();
+      let new = self.files.get(&path).cloned().unwrap_or_default();
+      if old == new {
+        continue;
+      }
+      changed += 1;
+      if update_all {
+        write_atomically(&path, &new)?;
+      } else {
+        let display = path.strip_prefix(&self.root).unwrap_or(&path);
+        println!("{}", display.display());
+        styles.print_diff(&old, &new, &mut std::io::stdout(), 3)?;
+        println!();
+      }
+    }
+    Ok(changed)
+  }
+}
+
+fn run_seed(
+  session: &mut MultiWriteSession,
+  rules: &RuleCollection<SgLang>,
+  seed: &Seed,
+) -> Result<()> {
+  let Some(rule) = rules.get_rule(&seed.rule_id) else {
+    return Err(anyhow!("rule `{}` disappeared", seed.rule_id));
+  };
+  let Some(writer) = rule.multi_writers.get(&seed.writer_id) else {
+    return Err(anyhow!(
+      "multi-writer `{}` disappeared from rule `{}`",
+      seed.writer_id,
+      seed.rule_id
+    ));
+  };
+
+  let mut queue = VecDeque::from([(seed.path.clone(), 0usize, seed.vars.clone())]);
+  let mut seen = HashSet::new();
+  while let Some((path, depth, bindings)) = queue.pop_front() {
+    if seen.len() >= writer.max_files || !seen.insert(path.clone()) {
+      continue;
+    }
+    let Some(lang) = SgLang::from_path(&path) else {
+      continue;
+    };
+    if lang != rule.language {
+      continue;
+    }
+    let Ok(content) = session.load(&path) else {
+      continue;
+    };
+    let grep = lang.ast_grep(content.clone());
+
+    let mut edits = if depth == 0 && path == seed.path {
+      collect_seed_fix_edits(rule, &content, seed, lang)
+    } else {
+      vec![]
+    };
+    edits.extend(collect_rewrite_edits(writer, &grep, &bindings));
+    if !edits.is_empty() {
+      let new_content = apply_edits(&content, edits);
+      if new_content != content {
+        session.files.insert(path.clone(), new_content);
+      }
+    }
+
+    if depth == 0 {
+      for target in collect_search_targets(writer, session, &bindings, rule.language) {
+        queue.push_back((target, depth + 1, bindings.clone()));
+      }
+    }
+    if (depth == 0 || writer.recursive) && depth < writer.max_depth {
+      let targets = collect_follow_targets(writer, &grep, &bindings, &path, &session.root);
+      for (target, vars) in targets {
+        queue.push_back((target, depth + 1, vars));
+      }
+    }
+  }
+  Ok(())
+}
+
+fn collect_seed_fix_edits(
+  rule: &RuleConfig<SgLang>,
+  content: &str,
+  seed: &Seed,
+  lang: SgLang,
+) -> Vec<Edit<String>> {
+  let Some(fixer) = rule.fixer.first() else {
+    return vec![];
+  };
+  let grep = lang.ast_grep(content);
+  let matches: Vec<_> = grep.root().find_all(&rule.matcher).collect();
+  let matched = matches
+    .iter()
+    .find(|matched| matched.text() == seed.text)
+    .or_else(|| {
+      matches
+        .iter()
+        .find(|matched| matched.range().start == seed.start)
+    });
+  matched
+    .map(|matched| vec![matched.make_edit(&rule.matcher, fixer)])
+    .unwrap_or_default()
+}
+
+fn seed_env<'a>(
+  bindings: &HashMap<String, String>,
+) -> MetaVarEnv<'a, ast_grep_core::tree_sitter::StrDoc<SgLang>> {
+  let mut env = MetaVarEnv::new();
+  for (name, value) in bindings {
+    env.insert_owned_var(name, value);
+  }
+  env
+}
+
+fn collect_rewrite_edits(
+  writer: &MultiWriter,
+  grep: &ast_grep_core::AstGrep<ast_grep_core::tree_sitter::StrDoc<SgLang>>,
+  bindings: &HashMap<String, String>,
+) -> Vec<Edit<String>> {
+  let mut edits = vec![];
+  for node in grep.root().dfs() {
+    for rewriter in &writer.rewrite {
+      let mut env = Cow::Owned(seed_env(bindings));
+      if let Some(matched) = rewriter.matcher.match_node_with_env(node.clone(), &mut env) {
+        let matched = NodeMatch::new(matched, env.into_owned());
+        let fixer = rewriter.fixer.first().expect("rewriter must have a fixer");
+        edits.push(matched.make_edit(&rewriter.matcher, fixer));
+        break;
+      }
+    }
+  }
+  edits
+}
+
+fn collect_search_targets(
+  writer: &MultiWriter,
+  session: &MultiWriteSession,
+  bindings: &HashMap<String, String>,
+  lang: SgLang,
+) -> Vec<PathBuf> {
+  if writer.search.is_empty() {
+    return vec![];
+  }
+  let mut targets = vec![];
+  for path in &session.candidates {
+    let Some(candidate_lang) = SgLang::from_path(path) else {
+      continue;
+    };
+    if candidate_lang != lang {
+      continue;
+    }
+    let Ok(relative) = path.strip_prefix(&session.root) else {
+      continue;
+    };
+    let matching: Vec<_> = writer
+      .search
+      .iter()
+      .filter(|search| search.files.is_match(relative))
+      .collect();
+    if matching.is_empty() {
+      continue;
+    }
+    let Some(content) = session.peek(path) else {
+      continue;
+    };
+    let grep = lang.ast_grep(content);
+    'rules: for search in matching {
+      for node in grep.root().dfs() {
+        let mut env = Cow::Owned(seed_env(bindings));
+        if search.matcher.match_node_with_env(node, &mut env).is_some() {
+          targets.push(path.clone());
+          break 'rules;
+        }
+      }
+    }
+  }
+  targets.sort();
+  targets.dedup();
+  targets
+}
+
+fn collect_follow_targets(
+  writer: &MultiWriter,
+  grep: &ast_grep_core::AstGrep<ast_grep_core::tree_sitter::StrDoc<SgLang>>,
+  bindings: &HashMap<String, String>,
+  from: &Path,
+  root: &Path,
+) -> Vec<(PathBuf, HashMap<String, String>)> {
+  let mut targets = vec![];
+  let mut seen = HashSet::new();
+  for node in grep.root().dfs() {
+    for follow in &writer.follow {
+      let Some((path, vars)) = match_follow(follow, node.clone(), bindings, from, root) else {
+        continue;
+      };
+      for target in path {
+        if seen.insert(target.clone()) {
+          targets.push((target, vars.clone()));
+        }
+      }
+    }
+  }
+  targets
+}
+
+fn match_follow(
+  follow: &FollowRule,
+  node: ast_grep_core::Node<'_, ast_grep_core::tree_sitter::StrDoc<SgLang>>,
+  bindings: &HashMap<String, String>,
+  from: &Path,
+  root: &Path,
+) -> Option<(Vec<PathBuf>, HashMap<String, String>)> {
+  let mut env = Cow::Owned(seed_env(bindings));
+  let matched = follow.matcher.match_node_with_env(node, &mut env)?;
+  let matched = NodeMatch::new(matched, env.into_owned());
+  let rendered = follow.path.generate_replacement(&matched);
+  let rendered = String::from_utf8_lossy(&rendered);
+  let mut vars: HashMap<String, String> = bindings.clone();
+  let matched_vars: HashMap<String, String> = matched.get_env().clone().into();
+  vars.extend(matched_vars);
+  let paths = resolve_target(from, &rendered, follow.resolve, root);
+  Some((paths, vars))
+}
+
+fn resolve_target(from: &Path, raw: &str, resolve: FollowResolve, root: &Path) -> Vec<PathBuf> {
+  let raw = unquote(raw.trim());
+  if raw.is_empty() {
+    return vec![];
+  }
+  let base = match resolve {
+    FollowResolve::Relative => from.parent().unwrap_or(Path::new(".")),
+    FollowResolve::Module => {
+      if raw.starts_with('.') || raw.starts_with('/') {
+        from.parent().unwrap_or(Path::new("."))
+      } else {
+        // Bare package specifiers need a package-manager-aware resolver.
+        return vec![];
+      }
+    }
+  };
+  let target = base.join(raw);
+  let mut ret: Vec<_> = candidates(target)
+    .into_iter()
+    .filter_map(|candidate| candidate.canonicalize().ok())
+    .filter(|candidate| candidate.is_file() && candidate.starts_with(root))
+    .collect();
+  ret.sort();
+  ret.dedup();
+  ret
+}
+
+fn unquote(raw: &str) -> &str {
+  for quote in ['\'', '"', '`'] {
+    if raw.len() >= 2 && raw.starts_with(quote) && raw.ends_with(quote) {
+      return &raw[1..raw.len() - 1];
+    }
+  }
+  raw
+}
+
+const JS_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"];
+
+fn candidates(path: PathBuf) -> Vec<PathBuf> {
+  let mut ret = vec![];
+  if path.is_file() {
+    ret.push(path.clone());
+  }
+  if path.extension().is_none() {
+    for ext in JS_EXTENSIONS {
+      ret.push(path.with_extension(ext));
+    }
+    for ext in JS_EXTENSIONS {
+      ret.push(path.join("index").with_extension(ext));
+    }
+  } else if path.is_dir() {
+    for ext in JS_EXTENSIONS {
+      ret.push(path.join("index").with_extension(ext));
+    }
+  } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+    && matches!(ext, "js" | "jsx" | "mjs" | "cjs")
+  {
+    for replacement in ["ts", "tsx", "mts", "cts"] {
+      ret.push(path.with_extension(replacement));
+    }
+  }
+  ret
+}
+
+fn apply_edits(old: &str, mut edits: Vec<Edit<String>>) -> String {
+  edits.sort_by_key(|edit| (edit.position, edit.deleted_length));
+  let mut new = String::with_capacity(old.len());
+  let mut cursor = 0;
+  for edit in edits {
+    if edit.position < cursor || edit.position > old.len() {
+      continue;
+    }
+    let end = edit.position + edit.deleted_length;
+    if end > old.len() {
+      continue;
+    }
+    new.push_str(&old[cursor..edit.position]);
+    new.push_str(&String::from_utf8_lossy(&edit.inserted_text));
+    cursor = end;
+  }
+  new.push_str(&old[cursor..]);
+  new
+}

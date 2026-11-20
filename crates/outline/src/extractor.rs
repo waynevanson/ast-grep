@@ -76,6 +76,8 @@ impl<L: Language> SerializableOutlineCommon<L> {
       core: self.matcher,
       fix: None,
       rewriters: self.rewriters,
+      multi_writers: None,
+      multi_fix: None,
       id: self.id,
       language: self.language,
       message: String::new(),

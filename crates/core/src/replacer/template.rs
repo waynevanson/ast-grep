@@ -137,7 +137,13 @@ where
       return Some(bytes);
     }
     MetaVarExtract::Single(name) => {
-      let replaced = env.get_match(name)?;
+      let Some(replaced) = env.get_match(name) else {
+        let var = crate::meta_var::MetaVariable::Capture(name.clone(), false);
+        let bytes = env.get_var_bytes(&var)?;
+        let de_intended = DeindentedExtract::MultiLine(bytes, 0);
+        let bytes = indent_lines::<D::Source>(*indent, de_intended);
+        return Some(bytes);
+      };
       let source = replaced.get_doc().get_source();
       let range = replaced.range();
       (source, range)

@@ -3,10 +3,14 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, fenix, ... }:
     let
       systems = [
         "x86_64-linux"
@@ -21,9 +25,20 @@
           pkgs = nixpkgs.legacyPackages.${system};
           inherit (nixpkgs.lib) importTOML;
           version = (importTOML ./Cargo.toml).workspace.package.version;
+
+          # Derive the toolchain from rust-toolchain.toml so Nix builds use the
+          # same channel and components as the rest of the repository.
+          rustToolchain = fenix.packages.${system}.fromToolchainFile {
+            file = ./rust-toolchain.toml;
+            sha256 = "sha256-MFHoWVcPZKjFrLnQnodCXbUsfZcofGfo9tV9fTTvklg=";
+          };
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
         in
         rec {
-          ast-grep = pkgs.rustPlatform.buildRustPackage {
+          ast-grep = rustPlatform.buildRustPackage {
             pname = "ast-grep";
             inherit version;
 
@@ -61,15 +76,10 @@
 
           devShell = pkgs.mkShell {
             inputsFrom = [ ast-grep ];
-            packages = with pkgs; [
-              cargo
-              rustc
-              rustfmt
-              clippy
-              rust-analyzer
+            packages = [
+              rustToolchain
+              pkgs.rust-analyzer
             ];
-            # Keep the toolchain aligned with the repository's MSRV.
-            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           };
 
           formatter = pkgs.nixfmt;

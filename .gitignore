@@ -193,3 +193,6 @@ docs/_build/
 
 # Direnv
 /.direnv
+
+# nix
+/result

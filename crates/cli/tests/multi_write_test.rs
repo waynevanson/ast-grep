@@ -1042,3 +1042,48 @@ rule:
   }
   Ok(())
 }
+
+#[test]
+fn test_multi_writer_rule_flag_without_project() -> Result<()> {
+  let dir = create_test_files([
+    ("rules/rename.yml", simple_rename_rule()),
+    ("a.ts", "export const oldName = 1;\n"),
+  ])?;
+
+  Command::new(cargo_bin!())
+    .current_dir(dir.path())
+    .args(["multi-write", "--rule", "rules/rename.yml", "--update-all"])
+    .assert()
+    .success();
+
+  assert_eq!(
+    std::fs::read_to_string(dir.path().join("a.ts"))?,
+    "export const newName = 1;\n"
+  );
+  Ok(())
+}
+
+#[test]
+fn test_multi_writer_inline_rules_with_project() -> Result<()> {
+  let dir = create_test_files([
+    ("sgconfig.yml", "ruleDirs: []\n"),
+    ("a.ts", "export const oldName = 1;\n"),
+  ])?;
+
+  Command::new(cargo_bin!())
+    .current_dir(dir.path())
+    .args([
+      "multi-write",
+      "--inline-rules",
+      simple_rename_rule(),
+      "--update-all",
+    ])
+    .assert()
+    .success();
+
+  assert_eq!(
+    std::fs::read_to_string(dir.path().join("a.ts"))?,
+    "export const newName = 1;\n"
+  );
+  Ok(())
+}

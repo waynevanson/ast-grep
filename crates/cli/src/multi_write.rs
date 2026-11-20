@@ -9,7 +9,7 @@ use crate::lang::SgLang;
 use crate::print::ColorArg;
 use crate::utils::{DiffStyles, InputArgs, RuleOverwrite, write_atomically, write_new_file};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use ast_grep_config::{
   CreateRule, Fixer, FollowResolve, FollowRule, GlobalRules, MultiWriter, RuleCollection,
   RuleConfig, from_yaml_string,
@@ -117,6 +117,13 @@ struct Seed {
   text: String,
 }
 
+fn read_source_file(path: &Path) -> Option<(PathBuf, SgLang, String)> {
+  let path = path.canonicalize().ok()?;
+  let lang = SgLang::from_path(&path)?;
+  let content = std::fs::read_to_string(&path).ok()?;
+  Some((path, lang, content))
+}
+
 fn collect_seeds(
   rules: &RuleCollection<SgLang>,
   input: &InputArgs,
@@ -152,17 +159,8 @@ fn collect_seeds(
   paths.sort();
   let mut candidates = vec![];
   let mut seeds = vec![];
-  for path in paths {
-    let Ok(path) = path.canonicalize() else {
-      continue;
-    };
-    let Some(lang) = SgLang::from_path(&path) else {
-      continue;
-    };
+  for (path, lang, content) in paths.into_iter().filter_map(|path| read_source_file(&path)) {
     candidates.push(path.clone());
-    let Ok(content) = std::fs::read_to_string(&path) else {
-      continue;
-    };
     let grep = lang.ast_grep(content);
     let normalized = path.strip_prefix(root).unwrap_or(&path);
     for rule in rules.for_path(normalized) {
@@ -271,16 +269,13 @@ fn run_seed(
   rules: &RuleCollection<SgLang>,
   seed: &Seed,
 ) -> Result<()> {
-  let Some(rule) = rules.get_rule(&seed.rule_id) else {
-    return Err(anyhow!("rule `{}` disappeared", seed.rule_id));
-  };
-  let Some(writer) = rule.multi_writers.get(&seed.writer_id) else {
-    return Err(anyhow!(
-      "multi-writer `{}` disappeared from rule `{}`",
-      seed.writer_id,
-      seed.rule_id
-    ));
-  };
+  let rule = rules
+    .get_rule(&seed.rule_id)
+    .expect("seed rule must exist in collection");
+  let writer = rule
+    .multi_writers
+    .get(&seed.writer_id)
+    .expect("seed writer must exist in rule");
 
   let discovery = discover(writer, rule, seed, session);
   write_discovered(writer, rule, seed, &discovery, session);
@@ -316,9 +311,7 @@ fn discover(
     // are inherited by every file, while local discovery variables belong to
     // the file that produced them.
     for conflict in merge_keep_first(&mut vars, &bindings) {
-      if warned.insert(conflict.clone()) {
-        eprintln!("warning: multi-writer variable conflict: {conflict}");
-      }
+      warn_conflict(&mut warned, conflict);
     }
     if seen.len() >= writer.max_files || !seen.insert(path.clone()) {
       continue;
@@ -345,9 +338,7 @@ fn discover(
         collect_search_targets(writer, session, &seed.vars, rule.language)
       {
         for conflict in merge_keep_first(&mut vars, &target_vars) {
-          if warned.insert(conflict.clone()) {
-            eprintln!("warning: multi-writer variable conflict: {conflict}");
-          }
+          warn_conflict(&mut warned, conflict);
         }
         queue.push_back((target, depth + 1, target_vars));
       }
@@ -356,15 +347,19 @@ fn discover(
       let targets = collect_follow_targets(writer, &grep, &seed.vars, &path, &session.root);
       for (target, target_vars) in targets {
         for conflict in merge_keep_first(&mut vars, &target_vars) {
-          if warned.insert(conflict.clone()) {
-            eprintln!("warning: multi-writer variable conflict: {conflict}");
-          }
+          warn_conflict(&mut warned, conflict);
         }
         queue.push_back((target, depth + 1, target_vars));
       }
     }
   }
   Discovery { files, vars }
+}
+
+fn warn_conflict(warned: &mut HashSet<String>, conflict: String) {
+  if warned.insert(conflict.clone()) {
+    eprintln!("warning: multi-writer variable conflict: {conflict}");
+  }
 }
 
 fn merge_keep_first(
@@ -738,4 +733,207 @@ fn apply_edits(old: &str, mut edits: Vec<Edit<String>>) -> String {
   }
   new.push_str(&old[cursor..]);
   new
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+  use tempfile::tempdir;
+
+  fn test_rule() -> RuleConfig<SgLang> {
+    let yaml = r#"
+id: test
+language: TypeScript
+rule:
+  pattern: 'export const $OLD = $INIT'
+transform:
+  NEW:
+    replace:
+      source: $OLD
+      replace: old
+      by: new
+fix: 'export const $NEW = $INIT;'
+multiFix: [writer]
+multiWriters:
+  - id: writer
+    search:
+      - files: ['**/*.ts']
+        rule:
+          pattern: 'import { $OLD } from $SPEC'
+    rewrite:
+      - id: rename-ref
+        rule:
+          pattern: $OLD
+        fix: $NEW
+"#;
+    let mut rules = ast_grep_config::from_yaml_string::<SgLang>(yaml, &GlobalRules::default())
+      .expect("test rule should parse");
+    rules.pop().expect("test rule should exist")
+  }
+
+  fn test_seed(path: PathBuf, text: &str) -> Seed {
+    Seed {
+      path,
+      rule_id: "test".into(),
+      writer_id: "writer".into(),
+      vars: HashMap::new(),
+      start: 0,
+      text: text.into(),
+    }
+  }
+
+  #[test]
+  fn warn_conflict_deduplicates_by_message() {
+    let mut warned = HashSet::new();
+    warn_conflict(&mut warned, "conflict".into());
+    warn_conflict(&mut warned, "conflict".into());
+    assert_eq!(warned.len(), 1);
+  }
+
+  #[test]
+  fn merge_keep_first_preserves_existing_values() {
+    let mut target = HashMap::from([("A".to_string(), "first".to_string())]);
+    let incoming = HashMap::from([
+      ("A".to_string(), "second".to_string()),
+      ("B".to_string(), "new".to_string()),
+    ]);
+    let conflicts = merge_keep_first(&mut target, &incoming);
+    assert_eq!(target["A"], "first");
+    assert_eq!(target["B"], "new");
+    assert_eq!(conflicts.len(), 1);
+  }
+
+  #[test]
+  fn discover_skips_unknown_language_and_missing_content() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let rule = test_rule();
+    let writer = &rule.multi_writers["writer"];
+    let session = MultiWriteSession::new(root.clone(), vec![]);
+
+    let unknown = test_seed(root.join("missing.unknown"), "");
+    assert!(discover(writer, &rule, &unknown, &session).files.is_empty());
+
+    let missing = test_seed(root.join("missing.ts"), "");
+    assert!(discover(writer, &rule, &missing, &session).files.is_empty());
+  }
+
+  #[test]
+  fn write_discovered_skips_missing_unknown_and_wrong_language() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("missing.unknown"), "unknown").unwrap();
+    fs::write(root.join("other.rs"), "fn old_name() {}").unwrap();
+    let rule = test_rule();
+    let writer = &rule.multi_writers["writer"];
+    let seed = test_seed(root.join("missing.ts"), "");
+    let discovery = Discovery {
+      files: vec![
+        VisitedFile {
+          path: root.join("missing.ts"),
+          bindings: HashMap::new(),
+        },
+        VisitedFile {
+          path: root.join("missing.unknown"),
+          bindings: HashMap::new(),
+        },
+        VisitedFile {
+          path: root.join("other.rs"),
+          bindings: HashMap::new(),
+        },
+      ],
+      vars: HashMap::new(),
+    };
+    let mut session = MultiWriteSession::new(root, vec![]);
+    write_discovered(writer, &rule, &seed, &discovery, &mut session);
+  }
+
+  #[test]
+  fn collect_search_targets_skips_unusable_candidates() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("other.rs"), "fn old_name() {}").unwrap();
+    let rule = test_rule();
+    let writer = &rule.multi_writers["writer"];
+    let candidates = vec![
+      root.join("missing.unknown"),
+      root.join("other.rs"),
+      root.parent().unwrap().join("outside.ts"),
+      root.join("missing.ts"),
+    ];
+    let session = MultiWriteSession::new(root, candidates);
+    let lang = SgLang::from_path("dummy.ts").unwrap();
+    let targets = collect_search_targets(writer, &session, &HashMap::new(), lang);
+    assert!(targets.is_empty());
+  }
+
+  #[test]
+  fn collect_seed_fix_edits_falls_back_to_start_offset() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let rule = test_rule();
+    let content = "export const oldName = 1;\n";
+    let lang = SgLang::from_path("dummy.ts").unwrap();
+    let seed = test_seed(root.join("a.ts"), "different text");
+    let edits = collect_seed_fix_edits(&rule, content, &seed, lang);
+    assert_eq!(edits.len(), 1);
+  }
+
+  #[test]
+  fn normalize_lexical_handles_curdir_parentdir_and_escape() {
+    assert_eq!(
+      normalize_lexical(Path::new("./a/../b")).unwrap(),
+      PathBuf::from("b")
+    );
+    assert_eq!(normalize_lexical(Path::new("..")), None);
+  }
+
+  #[test]
+  fn resolve_create_path_handles_empty_and_absolute_paths() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let target = root.join("src/a.ts");
+    assert_eq!(resolve_create_path(&target, "", &root), None);
+    let absolute = root.join("generated.ts");
+    assert_eq!(
+      resolve_create_path(&target, absolute.to_str().unwrap(), &root),
+      Some(absolute)
+    );
+  }
+
+  #[test]
+  fn resolve_target_rejects_empty_path() {
+    let root = tempdir().unwrap();
+    assert!(
+      resolve_target(
+        &root.path().join("a.ts"),
+        "",
+        FollowResolve::Relative,
+        root.path()
+      )
+      .is_empty()
+    );
+  }
+
+  #[test]
+  fn candidates_probe_directory_with_extension() {
+    let dir = tempdir().unwrap();
+    let directory = dir.path().join("generated.bar");
+    fs::create_dir_all(&directory).unwrap();
+    let index = directory.join("index.ts");
+    fs::write(&index, "export const x = 1;\n").unwrap();
+    let found = candidates(directory);
+    assert!(found.contains(&index));
+  }
+
+  #[test]
+  fn apply_edits_skips_out_of_bounds_ranges() {
+    let edit = Edit {
+      position: 1,
+      deleted_length: 100,
+      inserted_text: b"x".to_vec(),
+    };
+    assert_eq!(apply_edits("abc", vec![edit]), "abc");
+  }
 }

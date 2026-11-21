@@ -111,7 +111,9 @@ fn check_var_in_transform<'r>(
     }
   }
   for trans in transform.values() {
-    let needed = trans.used_vars();
+    let Some(needed) = trans.used_vars() else {
+      continue;
+    };
     if !vars.contains(needed) {
       return Err(RuleCoreError::UndefinedMetaVar(
         needed.to_string(),

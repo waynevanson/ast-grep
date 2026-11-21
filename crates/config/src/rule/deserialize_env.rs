@@ -97,7 +97,9 @@ impl<L: Language> DependentRule for ParsedGlobalRule<L> {
 
 impl DependentRule for Trans<MetaVariable> {
   fn visit_dependency<'a>(&'a self, sorter: &mut TopologicalSort<'a, Self>) -> OrderResult<()> {
-    let used_var = self.used_vars();
+    let Some(used_var) = self.used_vars() else {
+      return Ok(());
+    };
     sorter.visit(used_var)
   }
 }

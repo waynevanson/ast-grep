@@ -1,3 +1,4 @@
+use super::files::Files;
 use super::rewrite::Rewrite;
 use super::{Ctx, TransformError, string_case};
 use ast_grep_core::meta_var::MetaVariable;
@@ -109,16 +110,21 @@ pub enum Trans<T> {
   Replace(Replace<T>),
   Convert(Convert<T>),
   Rewrite(Rewrite<T>),
+  /// One string per file in the directory of the file being scanned. It reads no
+  /// meta variable, so it has no `source`.
+  Files(Files),
 }
 
 impl<T> Trans<T> {
-  fn source(&self) -> &T {
+  /// The meta variable this transform reads, if it reads one.
+  fn source(&self) -> Option<&T> {
     use Trans as T;
     match self {
-      T::Replace(r) => &r.source,
-      T::Substring(s) => &s.source,
-      T::Convert(c) => &c.source,
-      T::Rewrite(r) => &r.source,
+      T::Replace(r) => Some(&r.source),
+      T::Substring(s) => Some(&s.source),
+      T::Convert(c) => Some(&c.source),
+      T::Rewrite(r) => Some(&r.source),
+      T::Files(_) => None,
     }
   }
 }
@@ -155,12 +161,25 @@ impl Trans<String> {
         separated_by: c.separated_by.clone(),
       }),
       T::Rewrite(r) => T::Rewrite(r.parse(lang)?),
+      // no meta variable to resolve, but the globs are known now
+      T::Files(f) => {
+        f.compile()
+          .map_err(|e| TransformError::Glob(e.to_string()))?;
+        T::Files(f.clone())
+      }
     })
   }
 }
 impl Trans<MetaVariable> {
   pub(super) fn insert<D: Doc>(&self, key: &str, ctx: &mut Ctx<'_, '_, D>) {
-    let src = self.source();
+    let Some(src) = self.source() else {
+      // nothing was matched, so there is no node to re-indent to
+      let bytes = self.compute(ctx).map_or_else(Vec::new, |s| {
+        <D::Source as Content>::decode_str(&s).to_vec()
+      });
+      ctx.env.insert_detached(key, bytes);
+      return;
+    };
     // TODO: add this debug assertion back
     // debug_assert!(ctx.env.get_transformed(key).is_none());
     // avoid cyclic
@@ -180,6 +199,7 @@ impl Trans<MetaVariable> {
       T::Substring(s) => s.compute(ctx),
       T::Convert(c) => c.compute(ctx),
       T::Rewrite(r) => r.compute(ctx),
+      T::Files(f) => f.compute(),
     }
   }
 
@@ -190,16 +210,18 @@ impl Trans<MetaVariable> {
       T::Substring(_) => &[],
       T::Convert(_) => &[],
       T::Rewrite(r) => &r.rewriters,
+      T::Files(_) => &[],
     }
   }
-  pub fn used_vars(&self) -> &str {
-    let s = self.source();
+  /// The meta variable name this transform reads, if it reads one.
+  pub fn used_vars(&self) -> Option<&str> {
+    let s = self.source()?;
     use MetaVariable as MV;
-    match s {
+    Some(match s {
       MV::Capture(v, _) => v,
       MV::MultiCapture(v) => v,
       MV::Dropped(_) | MV::Multiple => panic!("transform var must be named"),
-    }
+    })
   }
 }
 

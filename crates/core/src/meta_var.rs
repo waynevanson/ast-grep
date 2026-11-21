@@ -174,6 +174,12 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
     self.transformed_var.insert(name.to_string(), deindented);
   }
 
+  /// Insert a transformed value that did not come from a matched node, so it
+  /// cannot be re-indented to one.
+  pub fn insert_detached(&mut self, name: &str, slice: Underlying<D>) {
+    self.transformed_var.insert(name.to_string(), slice);
+  }
+
   pub fn get_transformed(&self, var: &str) -> Option<&Underlying<D>> {
     self.transformed_var.get(var)
   }

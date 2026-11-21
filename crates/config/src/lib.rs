@@ -4,6 +4,7 @@ mod fixer;
 mod label;
 mod maybe;
 mod multi_writer;
+pub mod path_context;
 mod rewriter;
 mod rule;
 mod rule_collection;

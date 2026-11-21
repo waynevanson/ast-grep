@@ -22,6 +22,7 @@ use crate::utils::{ContextArgs, InputArgs, OutputArgs, OverwriteArgs, filter_fil
 use crate::utils::{ErrorContext as EC, MaxItemCounter};
 use crate::utils::{FileTrace, ScanTrace};
 use crate::utils::{Items, PathWorker, StdInWorker, Worker};
+use ast_grep_config::path_context::with_file;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -263,6 +264,24 @@ impl PathWorker for ScanWithConfig {
     path: &Path,
     processor: &P::Processor,
   ) -> Result<Vec<P::Processed>> {
+    // transforms that describe a directory read the path of the file they run on
+    with_file(path, || self.scan_file::<P>(path, processor))
+  }
+
+  fn should_stop(&self) -> bool {
+    match &self.max_item_counter {
+      Some(max) => max.reached_max(),
+      None => false,
+    }
+  }
+}
+
+impl ScanWithConfig {
+  fn scan_file<P: Printer>(
+    &self,
+    path: &Path,
+    processor: &P::Processor,
+  ) -> Result<Vec<P::Processed>> {
     let items = filter_file_rule(path, &self.configs, &self.trace)?;
     let mut error_count = 0usize;
     let mut ret = vec![];
@@ -311,13 +330,6 @@ impl PathWorker for ScanWithConfig {
     }
     self.error_count.fetch_add(error_count, Ordering::AcqRel);
     Ok(ret)
-  }
-
-  fn should_stop(&self) -> bool {
-    match &self.max_item_counter {
-      Some(max) => max.reached_max(),
-      None => false,
-    }
   }
 }
 
@@ -415,6 +427,7 @@ impl StdInWorker for ScanStdin {
     Ok(ret)
   }
 }
+
 fn match_rule_diff_on_file<T>(
   path: &Path,
   matches: Vec<(&RuleConfig<SgLang>, NodeMatch<StrDoc<SgLang>>)>,

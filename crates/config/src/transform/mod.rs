@@ -1,3 +1,4 @@
+mod files;
 mod parse;
 mod rewrite;
 mod string_case;
@@ -48,6 +49,8 @@ pub enum TransformError {
   AlreadyDefined(String),
   #[error("source `{0}` should be $-prefixed.")]
   MalformedVar(String),
+  #[error("Cannot parse glob: {0}.")]
+  Glob(String),
 }
 
 pub struct Transform {

@@ -178,7 +178,13 @@ pub fn filter_file_rule(
   let Some(lang) = SgLang::from_path(path) else {
     return Ok(smallvec![]);
   };
-  let file_content = read_file(path)?;
+  // an empty file still parses, and a rule that writes the whole file — one whose
+  // transform reads the directory rather than a node — has nothing to match
+  let file_content = match read_file(path) {
+    Ok(content) => content,
+    Err(err) if err.downcast_ref::<EmptyFile>().is_some() => String::new(),
+    Err(err) => return Err(err),
+  };
   let grep = lang.ast_grep(file_content);
   collect_file_stats(path, lang, configs, trace)?;
   let mut ret = smallvec![grep.clone()];

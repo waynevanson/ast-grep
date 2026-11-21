@@ -18,7 +18,8 @@
 
 ast-grep(sg) is a CLI tool for code structural search, lint, and rewriting.
 
-The multi is the feature of Multi File Rewriters, which allows a change to a file to reference multiple files.
+This fork adds multi-file rewrites: one rule match can drive coordinated changes
+across related files. See [Multi-file rewrites](docs/multi-writers.md).
 
 ## Introduction
 ast-grep is an [abstract syntax tree](https://dev.to/balapriya/abstract-syntax-tree-ast-explained-in-plain-english-1h38) based tool to search code by pattern code. Think of it as your old-friend [`grep`](https://en.wikipedia.org/wiki/Grep#:~:text=grep%20is%20a%20command%2Dline,which%20has%20the%20same%20effect.), but matching AST nodes instead of text.
@@ -94,6 +95,22 @@ ast-grep -p 'new Zodios($URL,  $CONF as const,)' -l ts -r 'new Zodios($URL, $CON
 ```
 
 * [Implement eslint rule using YAML.](https://twitter.com/Hchan_mgn/status/1560108625460355073)
+
+
+## Multi-file rewrites
+
+Use `multi-write` when a change in one file must also update files that
+reference it. Rules declare named `multiWriters` and opt into them with
+`multiFix`. A multi-writer can follow imports, search candidate files, rewrite
+every visited file, and create new files from templates.
+
+```bash
+ast-grep multi-write            # preview the complete diff
+ast-grep multi-write -U         # apply the changes
+```
+
+[Read the multi-writer guide](docs/multi-writers.md) for configuration details
+and examples.
 
 
 ## Sponsor

@@ -76,10 +76,14 @@
 
           devShell = pkgs.mkShell {
             inputsFrom = [ ast-grep ];
-            packages = [
-              rustToolchain
-              pkgs.rust-analyzer
-            ];
+            # Use rust-analyzer from the fenix toolchain: it matches the
+            # rustc/cargo/rust-src components configured in
+            # rust-toolchain.toml, so it can find the standard library sources.
+            packages = [ rustToolchain ];
+
+            shellHook = ''
+              export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
+            '';
           };
 
           formatter = pkgs.nixfmt;

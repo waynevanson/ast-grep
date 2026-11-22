@@ -36,6 +36,50 @@
             cargo = rustToolchain;
             rustc = rustToolchain;
           };
+
+          # `cleanSource` filters out `.so` files by default, but the CLI
+          # integration tests need the prebuilt dynamic language fixtures.
+          testSrc = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              pkgs.lib.cleanSourceFilter path type
+              || pkgs.lib.hasPrefix "${toString ./fixtures}/" (toString path);
+          };
+
+          # Wrap a cargo command in the standard Rust build setup so that the
+          # workspace dependencies are vendored and available offline in the
+          # Nix sandbox.
+          mkCargoCheck =
+            name: command:
+            rustPlatform.buildRustPackage {
+              pname = "ast-grep-${name}";
+              inherit version;
+
+              src = testSrc;
+
+              cargoLock.lockFile = ./Cargo.lock;
+
+              doCheck = false;
+
+              buildPhase = ''
+                runHook preBuild
+                ${command}
+                runHook postBuild
+              '';
+
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out
+                runHook postInstall
+              '';
+
+              meta = {
+                description = "ast-grep ${name}";
+                homepage = "https://ast-grep.github.io/";
+                license = pkgs.lib.licenses.mit;
+              };
+            };
         in
         rec {
           ast-grep = rustPlatform.buildRustPackage {
@@ -52,7 +96,8 @@
               "--package"
               "ast-grep"
             ];
-            # Tests depend on fixtures and external tooling; keep the build lean.
+            # The full workspace test suite runs in the `checks` output;
+            # keep the package build lean.
             doCheck = false;
 
             nativeBuildInputs = [ pkgs.installShellFiles ];
@@ -70,6 +115,17 @@
               license = pkgs.lib.licenses.mit;
               mainProgram = "ast-grep";
             };
+          };
+
+          checks = {
+            # `cargo check` the whole workspace, treating warnings as errors.
+            cargo-check = mkCargoCheck "cargo-check" ''
+              RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --locked --offline
+            '';
+            # Run the full workspace test suite.
+            cargo-test = mkCargoCheck "cargo-test" ''
+              cargo test --workspace --all-targets --locked --offline
+            '';
           };
 
           default = ast-grep;
@@ -98,6 +154,8 @@
       devShells = eachSystem (system: {
         default = (perSystem system).devShell;
       });
+
+      checks = eachSystem (system: (perSystem system).checks);
 
       formatter = eachSystem (system: (perSystem system).formatter);
 

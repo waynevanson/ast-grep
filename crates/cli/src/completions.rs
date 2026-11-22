@@ -80,7 +80,7 @@ mod test {
     let arg = CompletionsArg {
       shell: Some(Shell::Bash),
     };
-    run_shell_completion_impl::<App, _>(arg, &mut output).expect("should succeed");
+    let _ = run_shell_completion_impl::<App, _>(arg, &mut output).expect("should succeed");
     let output = String::from_utf8(output).expect("should be valid");
     assert!(output.contains("ast_grep"));
   }

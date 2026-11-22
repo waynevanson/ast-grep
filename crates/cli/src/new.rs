@@ -271,7 +271,7 @@ fn create_new_rule(found: ProjectConfig, arg: NewArg) -> Result<ExitCode> {
   println!("Created rules at {}", path.display());
   let need_test = arg.confirm("Do you also need to create a test for the rule?")?;
   if need_test {
-    create_new_test(test_configs, Some(name))?;
+    let _ = create_new_test(test_configs, Some(name))?;
   }
   Ok(ExitCode::SUCCESS)
 }
@@ -376,7 +376,7 @@ mod test {
       lang: None,
       yes: true,
     };
-    create_new_project(arg, tempdir)?;
+    let _ = create_new_project(arg, tempdir)?;
     assert!(tempdir.join("sgconfig.yml").exists());
     Ok(())
   }
@@ -392,7 +392,7 @@ mod test {
       lang: Some(SupportLang::Rust.into()),
       yes: true,
     };
-    run_create_new(arg, project)?;
+    let _ = run_create_new(arg, project)?;
     assert!(temp.join("rules/test-rule.yml").exists());
     Ok(())
   }
@@ -408,7 +408,7 @@ mod test {
       lang: Some(SupportLang::Rust.into()),
       yes: true,
     };
-    run_create_new(arg, project)?;
+    let _ = run_create_new(arg, project)?;
     assert!(temp.join("utils/test-utils.yml").exists());
     Ok(())
   }
